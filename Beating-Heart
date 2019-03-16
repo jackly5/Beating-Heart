@@ -1,0 +1,269 @@
+#include "mbed.h"
+
+
+
+#define false 0
+
+#define true 1
+
+Ticker tick;
+
+DigitalOut leds(D12);
+
+DigitalOut led1(LED1);
+
+AnalogIn pulsepin(A0);//analog input pin
+
+Serial pc(SERIAL_TX, SERIAL_RX);//USB TO SERIAL
+
+
+
+// these variables are volatile because they are used during the shorterrupt service routine!
+
+volatile short BPM;                   // used to hold the pulse rate
+
+volatile short Signal;                // holds the incoming raw data
+
+volatile short IBI = 600;             // holds the time between beats, must be seeded!
+
+volatile char Pulse = false;     // true when pulse wave is high, false when it's low
+
+volatile char QS = false;        // becomes true when Arduoino finds a beat.
+
+volatile short rate[10];                    // array to hold last ten IBI values
+
+volatile unsigned long sampleCounter = 0;          // used to determine pulse timing
+
+volatile unsigned long lastBeatTime = 0;           // used to find IBI
+
+volatile short P =512;                      // used to find peak in pulse wave, seeded
+
+volatile short T = 512;                     // used to find trough in pulse wave, seeded
+
+volatile short thresh = 512;                // used to find instant moment of heart beat, seeded
+
+volatile short amp = 100;                   // used to hold amplitude of pulse waveform, seeded
+
+volatile char firstBeat = true;        // used to seed rate array so we startup with reasonable BPM
+
+volatile char secondBeat = false;      // used to seed rate array so we startup with reasonable BPM
+
+
+
+//void ledFadeToBeat()
+
+//{
+
+//    fadeRate -= 15;                         //  set LED fade value
+
+//    fadeRate = constrain(fadeRate,0,255);   //  keep LED fade value from going shorto negative numbers!
+
+//    analogWrite(fadePin,fadeRate);          //  fade LED
+
+//}
+
+void timer_isr(void)
+
+{
+
+    //cli();                                      // disable shorterrupts while we do this
+
+    
+
+    Signal = pulsepin.read_u16()>>6;              // read the Pulse Sensor
+
+    sampleCounter += 2;                         // keep track of the time in mS with this variable
+
+    short N = sampleCounter - lastBeatTime;       // monitor the time since the last beat to avoid noise
+
+
+
+    //  find the peak and trough of the pulse wave
+
+    if(Signal < thresh && N > (IBI/5)*3) {      // avoid dichrotic noise by waiting 3/5 of last IBI
+
+        if (Signal < T) {                       // T is the trough
+
+            T = Signal;                         // keep track of lowest poshort in pulse wave
+
+        }
+
+    }
+
+
+
+    if(Signal > thresh && Signal > P) {         // thresh condition helps avoid noise
+
+        P = Signal;                             // P is the peak
+
+    }                                        // keep track of highest poshort in pulse wave
+
+
+
+    //  NOW IT'S TIME TO LOOK FOR THE HEART BEAT
+
+    // signal surges up in value every time there is a pulse
+
+    if (N > 250) {                                  // avoid high frequency noise
+
+        if ( (Signal > thresh) && (Pulse == false) && (N > (IBI/5)*3) ) {
+
+            Pulse = true;                               // set the Pulse flag when we think there is a pulse
+
+            leds=1;                // turn on pin 13 LED
+
+            IBI = sampleCounter - lastBeatTime;         // measure time between beats in mS
+
+            lastBeatTime = sampleCounter;               // keep track of time for next pulse
+
+
+
+            if(secondBeat) {                       // if this is the second beat, if secondBeat == TRUE
+
+                secondBeat = false;                  // clear secondBeat flag
+
+                for(short i=0; i<=9; i++) {            // seed the running total to get a realisitic BPM at startup
+
+                    rate[i] = IBI;
+
+                }
+
+            }
+
+
+
+            if(firstBeat) {                        // if it's the first time we found a beat, if firstBeat == TRUE
+
+                firstBeat = false;                   // clear firstBeat flag
+
+                secondBeat = true;                   // set the second beat flag
+
+                //sei();                               // enable shorterrupts again
+
+                return;                              // IBI value is unreliable so discard it
+
+            }
+
+
+
+
+
+            // keep a running total of the last 10 IBI values
+
+            unsigned short runningTotal = 0;                  // clear the runningTotal variable
+
+
+
+            for(short i=0; i<=8; i++) {               // shift data in the rate array
+
+                rate[i] = rate[i+1];                  // and drop the oldest IBI value
+
+                runningTotal += rate[i];              // add up the 9 oldest IBI values
+
+            }
+
+
+
+            rate[9] = IBI;                          // add the latest IBI to the rate array
+
+            runningTotal += rate[9];                // add the latest IBI to runningTotal
+
+            runningTotal /= 10;                     // average the last 10 IBI values
+
+            BPM = 60000/runningTotal;               // how many beats can fit shorto a minute? that's BPM!
+
+            QS = true;                              // set Quantified Self flag
+
+            // QS FLAG IS NOT CLEARED INSIDE THIS ISR
+
+        }
+
+    }
+
+
+
+    if (Signal < thresh && Pulse == true) {  // when the values are going down, the beat is over
+
+        leds=0;            // turn off pin 13 LED
+
+        Pulse = false;                         // reset the Pulse flag so we can do it again
+
+        amp = P - T;                           // get amplitude of the pulse wave
+
+        thresh = amp/2 + T;                    // set thresh at 50% of the amplitude
+
+        P = thresh;                            // reset these for next time
+
+        T = thresh;
+
+    }
+
+
+
+    if (N > 2500) {                          // if 2.5 seconds go by without a beat
+
+        thresh = 512;                          // set thresh default
+
+        P = 512;                               // set P default
+
+        T = 512;                               // set T default
+
+        lastBeatTime = sampleCounter;          // bring the lastBeatTime up to date
+
+        firstBeat = true;                      // set these to avoid noise
+
+        secondBeat = false;                    // when we get the heartbeat back
+
+    }
+
+    //sei();                                   // enable shorterrupts when youre done!
+
+}
+
+
+
+void sendDataToProcessing(char symbol, short data )
+
+{
+
+    pc.putc(symbol);                // symbol prefix tells Processing what type of data is coming
+
+    pc.printf("%d\r\n", data);                // the data to send culminating in a carriage return
+
+}
+
+int main()
+
+{
+
+    pc.baud(115200);             // we agree to talk fast!
+
+    tick.attach_us(&timer_isr,2000);                 // sets up to read Pulse Sensor signal every 2mS
+
+    while(1) {
+
+        led1 =1;
+
+        sendDataToProcessing('S', Signal);     // send Processing the raw Pulse Sensor data
+
+        if (QS == true) {                      // Quantified Self flag is true when arduino finds a heartbeat
+
+            //fadeRate = 255;                  // Set 'fadeRate' Variable to 255 to fade LED with pulse
+
+            sendDataToProcessing('B',BPM);   // send heart rate with a 'B' prefix
+
+            sendDataToProcessing('Q',IBI);   // send time between beats with a 'Q' prefix
+
+            QS = false;                      // reset the Quantified Self flag for next time
+
+        }
+
+
+
+        //ledFadeToBeat();
+
+        wait(0.02);                             //  take a break
+
+    }
+
+}
